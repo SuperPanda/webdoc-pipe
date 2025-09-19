@@ -1,0 +1,520 @@
+#!/usr/bin/env rust-script
+//! webdoc-pipe: Pipe HTML/CSS/JS to a tiny HTTP viewer (Firefox) via a per-user daemon.
+//! 
+//! - No external crates; only Rust std.
+//! - Depends on `rust-script`
+//! - Linux/Unix only (uses Unix domain sockets).
+//!
+//! Usage examples:
+//!   $ webdoc-pipe open                  # open browser (firefox)
+//!   $ webdoc-pipe url                   # print URL
+//!   $ cat index.html | webdoc-pipe      # default = HTML update
+//!   $ cat index.html | webdoc-pipe html # explicit HTML update
+//!   $ cat style.css  | webdoc-pipe css
+//!   $ cat script.js  | webdoc-pipe js
+//!   $ webdoc-pipe stop                  # stop the daemon
+//!
+//! Protocol to server over UDS:
+//!   <KIND>
+//!   <BODY... until EOF>
+//!   where KIND in {"HTML","CSS","JS","STOP"}
+//!
+//! State is in-memory; updates are atomic via RwLock swap.
+
+use std::env;
+use std::fs::{self, File};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::{Arc, RwLock};
+use std::thread;
+use std::time::{Duration, Instant};
+
+#[derive(Clone)]
+struct DocState {
+    html: Arc<RwLock<Vec<u8>>>,
+    css: Arc<RwLock<Vec<u8>>>,
+    js: Arc<RwLock<Vec<u8>>>,
+}
+
+impl DocState {
+    fn new() -> Self {
+        let html = b"<!doctype html>
+<meta charset=\"utf-8\">
+<title>webdoc</title>
+<link rel=\"stylesheet\" href=\"/style.css\">
+<script defer src=\"./script.js\"></script>
+<h1>webdoc-pipe</h1>
+<p>Pipe HTML here: cat index.html | webdoc-pipe html</p>
+".to_vec();
+        let css = b"html{font-family:system-ui,sans-serif}body{margin:2rem;max-width:65ch}".to_vec();
+        let js  = b"/* webdoc default script */".to_vec();
+        Self {
+            html: Arc::new(RwLock::new(html)),
+            css:  Arc::new(RwLock::new(css)),
+            js:   Arc::new(RwLock::new(js)),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Meta {
+    pid: u32,
+    socket_path: PathBuf,
+    port: u16,
+}
+
+fn runtime_dir() -> PathBuf {
+    if let Ok(p) = env::var("XDG_RUNTIME_DIR") {
+        PathBuf::from(p)
+    } else {
+        // Fallback for systems without XDG_RUNTIME_DIR
+        env::temp_dir()
+    }
+}
+
+fn meta_path() -> PathBuf {
+    runtime_dir().join("webdoc-pipe.current")
+}
+
+fn parse_meta(s: &str) -> Option<Meta> {
+    let mut pid = None::<u32>;
+    let mut socket = None::<PathBuf>;
+    let mut port = None::<u16>;
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("PID=") {
+            pid = rest.trim().parse::<u32>().ok();
+        } else if let Some(rest) = line.strip_prefix("SOCKET=") {
+            socket = Some(PathBuf::from(rest.trim()));
+        } else if let Some(rest) = line.strip_prefix("PORT=") {
+            port = rest.trim().parse::<u16>().ok();
+        }
+    }
+    match (pid, socket, port) {
+        (Some(pid), Some(socket_path), Some(port)) => Some(Meta { pid, socket_path, port }),
+        _ => None,
+    }
+}
+
+fn load_meta() -> Option<Meta> {
+    let p = meta_path();
+    let data = fs::read_to_string(&p).ok()?;
+    let m = parse_meta(&data)?;
+    // sanity check: socket exists?
+    if m.socket_path.exists() {
+        Some(m)
+    } else {
+        // stale meta; clean up
+        let _ = fs::remove_file(&p);
+        None
+    }
+}
+
+fn atomic_write(path: &Path, contents: &str) -> io::Result<()> {
+    let tmp = path.with_extension(format!("new.{}", std::process::id()));
+    {
+        let mut f = File::create(&tmp)?;
+        f.write_all(contents.as_bytes())?;
+        f.sync_all()?;
+    }
+    fs::rename(tmp, path)?;
+    Ok(())
+}
+
+fn write_meta(m: &Meta) -> io::Result<()> {
+    let p = meta_path();
+    let text = format!("PID={}
+SOCKET={}
+PORT={}
+", m.pid, m.socket_path.display(), m.port);
+    atomic_write(&p, &text)
+}
+
+fn remove_meta_if_ours(pid: u32) {
+    if let Some(m) = load_meta() {
+        if m.pid == pid {
+            let _ = fs::remove_file(meta_path());
+        }
+    }
+}
+
+fn try_connect_uds(p: &Path) -> io::Result<UnixStream> {
+    UnixStream::connect(p)
+}
+
+fn ensure_server() -> io::Result<Meta> {
+    if let Some(m) = load_meta() {
+        if try_connect_uds(&m.socket_path).is_ok() {
+            return Ok(m);
+        } else {
+            // stale socket; try to remove and continue
+            let _ = fs::remove_file(&m.socket_path);
+            let _ = fs::remove_file(meta_path());
+        }
+    }
+    // Spawn server
+    let exe = env::current_exe()?;
+    let mut child = Command::new(exe)
+        .arg("serve")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    // Wait until meta is ready and socket responds
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(m) = load_meta() {
+            if try_connect_uds(&m.socket_path).is_ok() {
+                return Ok(m);
+            }
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "server start timeout"));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn open_url(port: u16) {
+    let url = format!("http://127.0.0.1:{}/", port);
+    // Prefer firefox
+    let ok = Command::new("firefox")
+        .arg(&url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if ok {
+        return;
+    }
+    let ok2 = Command::new("xdg-open")
+        .arg(&url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok2 {
+        println!("{}", url);
+    }
+}
+
+fn send_update(kind: &str, data: &[u8]) -> io::Result<Meta> {
+    let m = ensure_server()?;
+    let mut s = try_connect_uds(&m.socket_path)?;
+    s.write_all(kind.as_bytes())?;
+    s.write_all(b"
+
+")?;
+    s.write_all(data)?;
+    s.flush()?;
+    // Optional ACK (not strictly needed); ignore errors
+    let _ = s.shutdown(std::net::Shutdown::Write);
+    Ok(m)
+}
+
+fn send_stop() -> io::Result<()> {
+    let m = ensure_server()?;
+    let mut s = try_connect_uds(&m.socket_path)?;
+    s.write_all(b"STOP
+
+")?;
+    let _ = s.shutdown(std::net::Shutdown::Write);
+    Ok(())
+}
+
+fn serve_http_conn(mut tcp: TcpStream, st: DocState) -> io::Result<()> {
+    tcp.set_nodelay(true).ok();
+    let peer = tcp.peer_addr().ok();
+    let mut reader = BufReader::new(tcp.try_clone()?);
+
+    let mut req_line = String::new();
+    if reader.read_line(&mut req_line)? == 0 {
+        return Ok(());
+    }
+    // strip CRLF
+    req_line.truncate(req_line.trim_end_matches(|c| c == '\r' || c == '\n').len());
+
+    let parts: Vec<&str> = req_line.split_whitespace().collect();
+    let method = parts.get(0).copied().unwrap_or("");
+    let mut path = parts.get(1).copied().unwrap_or("/");
+
+    // consume headers
+    loop {
+        let mut h = String::new();
+        let n = reader.read_line(&mut h)?;
+        if n == 0 { break; }
+        let hs = h.trim_end_matches(|c| c == '\r' || c == '\n');
+        if hs.is_empty() { break; }
+    }
+
+    // normalize path
+    if path.is_empty() { path = "/"; }
+    if let Some(qpos) = path.find('?') {
+        path = &path[..qpos];
+    }
+    let rel = match path {
+        "/" | "/index.html" => "index.html",
+        "/style.css" => "style.css",
+        "/script.js" => "script.js",
+        s if s.starts_with('/') => &s[1..],
+        s => s,
+    };
+    // disallow traversal and dotfiles
+    if rel.contains("..") || rel.starts_with('.') {
+        respond_plain(&mut tcp, 403, "Forbidden")?;
+        return Ok(());
+    }
+
+    match rel {
+        "index.html" => {
+            let body = st.html.read().unwrap().clone();
+            respond(&mut tcp, 200, "text/html; charset=utf-8", &body)?;
+        }
+        "style.css" => {
+            let body = st.css.read().unwrap().clone();
+            respond(&mut tcp, 200, "text/css; charset=utf-8", &body)?;
+        }
+        "script.js" => {
+            let body = st.js.read().unwrap().clone();
+            respond(&mut tcp, 200, "application/javascript; charset=utf-8", &body)?;
+        }
+        _ => {
+            respond_plain(&mut tcp, 404, "Not Found")?;
+        }
+    }
+    let _ = peer;
+    Ok(())
+}
+
+fn respond(stream: &mut TcpStream, code: u16, ctype: &str, body: &[u8]) -> io::Result<()> {
+    let status = match code {
+        200 => "200 OK",
+        403 => "403 Forbidden",
+        404 => "404 Not Found",
+        _ => "200 OK",
+    };
+    let headers = format!(
+        "HTTP/1.1 {status}
+Content-Type: {ctype}
+Content-Length: {len}
+Cache-Control: no-cache, no-store, must-revalidate
+Pragma: no-cache
+Expires: 0
+Connection: close
+
+",
+        status=status, ctype=ctype, len=body.len()
+    );
+    stream.write_all(headers.as_bytes())?;
+    stream.write_all(body)?;
+    Ok(())
+}
+
+fn respond_plain(stream: &mut TcpStream, code: u16, msg: &str) -> io::Result<()> {
+    respond(stream, code, "text/plain; charset=utf-8", msg.as_bytes())
+}
+
+fn handle_update_conn(mut u: UnixStream, st: DocState, sock_path: PathBuf) -> io::Result<()> {
+    let mut reader = BufReader::new(u.try_clone()?);
+    let mut kind = String::new();
+    if reader.read_line(&mut kind)? == 0 {
+        return Ok(());
+    }
+
+    // strip CRLF
+    kind.truncate(kind.trim_end_matches(|c| c == '\r' || c == '\n').len());
+    let mut blank = String::new();
+
+    // Expect a blank line after kind
+    let _ = reader.read_line(&mut blank);
+    let mut data = Vec::new();
+    reader.read_to_end(&mut data)?;
+
+    match kind.trim() {
+        "HTML" => {
+            let mut w = st.html.write().unwrap();
+            *w = data;
+        }
+        "CSS" => {
+            let mut w = st.css.write().unwrap();
+            *w = data;
+        }
+        "JS" => {
+            let mut w = st.js.write().unwrap();
+            *w = data;
+        }
+        "STOP" => {
+            // best-effort cleanup then exit fast
+            let _ = fs::remove_file(&sock_path);
+            remove_meta_if_ours(std::process::id());
+            std::process::exit(0);
+        }
+        _ => {
+            // unknown command; ignore
+        }
+    }
+    Ok(())
+}
+
+fn run_server() -> io::Result<()> {
+    let st = DocState::new();
+
+    // HTTP
+    let http = TcpListener::bind(("127.0.0.1", 0))?;
+    http.set_nonblocking(false).ok();
+    let port = http.local_addr()?.port();
+
+    // UDS control socket
+    let pid = std::process::id();
+    let sock_path = runtime_dir().join(format!("webdoc-pipe-{}.sock", pid));
+    if sock_path.exists() {
+        let _ = fs::remove_file(&sock_path);
+    }
+    let uds = UnixListener::bind(&sock_path)?;
+    // Restrict permissions best-effort
+    #[allow(unused_must_use)]
+    {
+        let _ = fs::set_permissions(&sock_path, fs::Permissions::from_mode(0o600));
+    }
+
+    // Publish meta
+    write_meta(&Meta {
+        pid,
+        socket_path: sock_path.clone(),
+        port,
+    })?;
+
+    // UDS loop
+    let st_for_uds = st.clone();
+    let sock_path_for_uds = sock_path.clone();
+    let uds_thread = thread::spawn(move || -> io::Result<()> {
+        for conn in uds.incoming() {
+            match conn {
+                Ok(s) => {
+                    let st2 = st_for_uds.clone();
+                    let sp = sock_path_for_uds.clone();
+                    thread::spawn(move || {
+                        let _ = handle_update_conn(s, st2, sp);
+                    });
+                }
+                Err(e) => {
+                    // If listener is closed, exit loop
+                    if e.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
+    });
+
+    // HTTP loop (main thread)
+    for conn in http.incoming() {
+        match conn {
+            Ok(tcp) => {
+                let st2 = st.clone();
+                thread::spawn(move || {
+                    let _ = serve_http_conn(tcp, st2);
+                });
+            }
+            Err(e) => {
+                if e.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    let _ = uds_thread.join();
+    // Cleanup best-effort
+    let _ = fs::remove_file(&sock_path);
+    remove_meta_if_ours(pid);
+    Ok(())
+}
+
+fn print_usage() {
+    eprintln!("Usage:
+  webdoc-pipe open
+  webdoc-pipe url
+  webdoc-pipe stop
+  webdoc-pipe html        < file.html
+  webdoc-pipe css         < file.css
+  webdoc-pipe js          < file.js
+  # Shortcut: default to 'html' when data is piped:
+  cat index.html | webdoc-pipe
+");
+}
+
+fn main() -> io::Result<()> {
+    let args: Vec<String> = env::args().collect();
+    // Detect piped stdin for default 'html'
+    let piped_stdin = {
+        {
+            use std::io::IsTerminal;
+            !io::stdin().is_terminal()
+        }
+    };
+
+    match args.get(1).map(|s| s.as_str()) {
+        Some("serve") => run_server(),
+        Some("open") => {
+            let m = ensure_server()?;
+            open_url(m.port);
+            Ok(())
+        }
+        Some("url") => {
+            let m = ensure_server()?;
+            println!("http://127.0.0.1:{}/", m.port);
+            Ok(())
+        }
+        Some("stop") => {
+            let _ = send_stop();
+            Ok(())
+        }
+        Some("html") => {
+            let mut buf = Vec::new();
+            io::stdin().read_to_end(&mut buf)?;
+            let m = send_update("HTML", &buf)?;
+            println!("Updated HTML. URL: http://127.0.0.1:{}/", m.port);
+            Ok(())
+        }
+        Some("css") => {
+            let mut buf = Vec::new();
+            io::stdin().read_to_end(&mut buf)?;
+            let m = send_update("CSS", &buf)?;
+            println!("Updated CSS. URL: http://127.0.0.1:{}/", m.port);
+            Ok(())
+        }
+        Some("js") => {
+            let mut buf = Vec::new();
+            io::stdin().read_to_end(&mut buf)?;
+            let m = send_update("JS", &buf)?;
+            println!("Updated JS. URL: http://127.0.0.1:{}/", m.port);
+            Ok(())
+        }
+        None if piped_stdin => {
+            // default to HTML when data is piped
+            let mut buf = Vec::new();
+            io::stdin().read_to_end(&mut buf)?;
+            let m = send_update("HTML", &buf)?;
+            println!("Updated HTML. URL: http://127.0.0.1:{}/", m.port);
+            Ok(())
+        }
+        _ => {
+            print_usage();
+            Ok(())
+        }
+    }
+}
+use std::os::unix::fs::PermissionsExt;
