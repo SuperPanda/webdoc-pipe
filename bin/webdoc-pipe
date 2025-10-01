@@ -1,10 +1,6 @@
 #!/usr/bin/env rust-script
 //! webdoc-pipe: Serves piped HTML/CSS/JS as three HTTP files.
 //!
-//! Requires: 
-//! - rust-script (install with: `cargo install rust-script`)
-//! - Linux/Unix (uses Unix domain sockets)
-//!
 //! Usage:
 //!
 //!   $ webdoc-pipe html          # Pipe to index.html
@@ -14,12 +10,7 @@
 //!   $ webdoc-pipe url           # Print URL
 //!   $ webdoc-pipe stop          # Stop daemon
 //!
-//! Protocol to server over UDS:
-//!   <KIND>
-//!   <BODY... until EOF>
-//!   where KIND in {"HTML","CSS","JS","STOP"}
-//!
-//! State is in-memory; Updates are atomic.
+//! Zero external crates. Linux/Unix only.
 
 use std::env;
 use std::fs::{self, File};
