@@ -1,25 +1,25 @@
 #!/usr/bin/env rust-script
-//! webdoc-pipe: Pipe HTML/CSS/JS to a tiny HTTP viewer (Firefox) via a per-user daemon.
-//! 
-//! - No external crates; only Rust std.
-//! - Depends on `rust-script`
+//! webdoc-pipe: A stateful, in-memory document updated via pipes.
+//!
+//! - Zero dependencies (Rust std only)
+//! - Requires `rust-script`
 //! - Linux/Unix only (uses Unix domain sockets).
 //!
 //! Usage examples:
-//!   $ webdoc-pipe open                  # open browser (firefox)
-//!   $ webdoc-pipe url                   # print URL
-//!   $ cat index.html | webdoc-pipe      # default = HTML update
-//!   $ cat index.html | webdoc-pipe html # explicit HTML update
-//!   $ cat style.css  | webdoc-pipe css
-//!   $ cat script.js  | webdoc-pipe js
-//!   $ webdoc-pipe stop                  # stop the daemon
+//!
+//!   $ webdoc-pipe html          # Pipe to index.html
+//!   $ webdoc-pipe css           # Pipe to style.css
+//!   $ webdoc-pipe js            # Pipe to script.js
+//!   $ webdoc-pipe open          # Open in browser
+//!   $ webdoc-pipe url           # Print URL
+//!   $ webdoc-pipe stop          # Stop daemon
 //!
 //! Protocol to server over UDS:
 //!   <KIND>
 //!   <BODY... until EOF>
 //!   where KIND in {"HTML","CSS","JS","STOP"}
 //!
-//! State is in-memory; updates are atomic via RwLock swap.
+//! State is in-memory; Updates are atomic.
 
 use std::env;
 use std::fs::{self, File};
@@ -31,6 +31,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
+use std::os::unix::fs::PermissionsExt;
 
 #[derive(Clone)]
 struct DocState {
@@ -43,14 +44,14 @@ impl DocState {
     fn new() -> Self {
         let html = b"<!doctype html>
 <meta charset=\"utf-8\">
-<title>webdoc</title>
+<title>webdoc-pipe</title>
 <link rel=\"stylesheet\" href=\"/style.css\">
 <script defer src=\"./script.js\"></script>
 <h1>webdoc-pipe</h1>
-<p>Pipe HTML here: cat index.html | webdoc-pipe html</p>
+<p>Pipe HTML here:  cat index.html | webdoc-pipe</p>
 ".to_vec();
         let css = b"html{font-family:system-ui,sans-serif}body{margin:2rem;max-width:65ch}".to_vec();
-        let js  = b"/* webdoc default script */".to_vec();
+        let js  = b"/* webdoc-pipe default script */".to_vec();
         Self {
             html: Arc::new(RwLock::new(html)),
             css:  Arc::new(RwLock::new(css)),
@@ -242,7 +243,7 @@ fn serve_http_conn(mut tcp: TcpStream, st: DocState) -> io::Result<()> {
     req_line.truncate(req_line.trim_end_matches(|c| c == '\r' || c == '\n').len());
 
     let parts: Vec<&str> = req_line.split_whitespace().collect();
-    let method = parts.get(0).copied().unwrap_or("");
+    let _method = parts.get(0).copied().unwrap_or("");
     let mut path = parts.get(1).copied().unwrap_or("/");
 
     // consume headers
@@ -321,7 +322,7 @@ fn respond_plain(stream: &mut TcpStream, code: u16, msg: &str) -> io::Result<()>
     respond(stream, code, "text/plain; charset=utf-8", msg.as_bytes())
 }
 
-fn handle_update_conn(mut u: UnixStream, st: DocState, sock_path: PathBuf) -> io::Result<()> {
+fn handle_update_conn(u: UnixStream, st: DocState, sock_path: PathBuf) -> io::Result<()> {
     let mut reader = BufReader::new(u.try_clone()?);
     let mut kind = String::new();
     if reader.read_line(&mut kind)? == 0 {
@@ -444,18 +445,19 @@ fn run_server() -> io::Result<()> {
 }
 
 fn print_usage() {
-    eprintln!("Usage:
-  webdoc-pipe open
-  webdoc-pipe url
-  webdoc-pipe stop
-  webdoc-pipe html        < file.html
-  webdoc-pipe css         < file.css
-  webdoc-pipe js          < file.js
-  # Shortcut: default to 'html' when data is piped:
-  cat index.html | webdoc-pipe
-");
+    eprintln!(
+        "Usage:
+    webdoc-pipe open          # Open in browser
+    webdoc-pipe url           # Print URL
+    webdoc-pipe stop          # Stop daemon
+    webdoc-pipe html          # Pipe to index.html
+    webdoc-pipe css           # Pipe to style.css
+    webdoc-pipe js            # Pipe to script.js
+    
+Shortcut: 
+    cat file.html | webdoc-pipe   # → index.html"
+    );
 }
-
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
     // Detect piped stdin for default 'html'
@@ -517,4 +519,3 @@ fn main() -> io::Result<()> {
         }
     }
 }
-use std::os::unix::fs::PermissionsExt;
