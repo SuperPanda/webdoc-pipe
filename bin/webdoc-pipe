@@ -1,11 +1,11 @@
 #!/usr/bin/env rust-script
-//! webdoc-pipe: A stateful, in-memory document updated via pipes.
+//! webdoc-pipe: Serves piped HTML/CSS/JS as three HTTP files.
 //!
-//! - Zero dependencies (Rust std only)
-//! - Requires `rust-script`
-//! - Linux/Unix only (uses Unix domain sockets).
+//! Requires: 
+//! - rust-script (install with: `cargo install rust-script`)
+//! - Linux/Unix (uses Unix domain sockets)
 //!
-//! Usage examples:
+//! Usage:
 //!
 //!   $ webdoc-pipe html          # Pipe to index.html
 //!   $ webdoc-pipe css           # Pipe to style.css
