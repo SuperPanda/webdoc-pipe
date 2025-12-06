@@ -1,0 +1,71 @@
+.TH WEBDOC-PIPE 1 "2025-10-01" "v0.1.0" "User Commands"
+.SH NAME
+webdoc-pipe \- Serve piped HTML/CSS/JS as three HTTP files
+.SH SYNOPSIS
+.B webdoc-pipe open
+.br
+.B webdoc-pipe url
+.br
+.B webdoc-pipe stop
+.br
+.B webdoc-pipe html
+.br
+.B webdoc-pipe css
+.br
+.B webdoc-pipe js
+.SH DESCRIPTION
+\fBwebdoc-pipe\fR maintains an in-memory web document and serves it via HTTP at:
+.IP
+http://127.0.0.1:PORT/
+.PP
+It serves exactly three files:
+.RS
+.IP \[bu] 2
+\fI/\fR or \fI/index.html\fR → HTML content
+.IP \[bu] 2
+\fI/style.css\fR → CSS content
+.IP \[bu] 2
+\fI/script.js\fR → JavaScript content
+.RE
+.PP
+Content is updated by piping to subcommands:
+.IP
+cat index.html | webdoc-pipe html
+.PP
+The daemon starts automatically and runs per-user.
+.SH COMMANDS
+.TP
+\fBopen\fR
+Open the document in Firefox (or \fCxdg-open\fR).
+.TP
+\fBurl\fR
+Print the document URL.
+.TP
+\fBstop\fR
+Stop the daemon.
+.TP
+\fBhtml\fR
+Read stdin as HTML (served as \fI/index.html\fR).
+.TP
+\fBcss\fR
+Read stdin as CSS (served as \fI/style.css\fR).
+.TP
+\fBjs\fR
+Read stdin as JavaScript (served as \fI/script.js\fR).
+.SH FILES
+.TP
+\fI$XDG_RUNTIME_DIR/webdoc-pipe-*.sock\fR
+Unix domain socket.
+.TP
+\fI$XDG_RUNTIME_DIR/webdoc-pipe.current\fR
+Daemon metadata (PID, port, socket path).
+.SH ENVIRONMENT
+.TP
+\fBWEBDOC_BROWSER\fR
+Browser command (default: \fCfirefox\fR).
+.SH SEE ALSO
+firefox(1), xdg-open(1)
+.SH AUTHOR
+Andrew Briscoe
+.SH LICENSE
+MIT
