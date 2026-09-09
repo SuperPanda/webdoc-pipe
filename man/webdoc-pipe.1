@@ -1,7 +1,9 @@
-.TH WEBDOC-PIPE 1 "2025-10-01" "v0.1.0" "User Commands"
+.TH WEBDOC-PIPE 1 "2026-09-09" "v0.1.1" "User Commands"
 .SH NAME
 webdoc-pipe \- Serve piped HTML/CSS/JS as three HTTP files
 .SH SYNOPSIS
+.B webdoc-pipe version
+.br
 .B webdoc-pipe open
 .br
 .B webdoc-pipe url
@@ -34,6 +36,9 @@ cat index.html | webdoc-pipe html
 .PP
 The daemon starts automatically and runs per-user.
 .SH COMMANDS
+.TP
+\fBversion\fR
+Display the application name and version.
 .TP
 \fBopen\fR
 Open the document in Firefox (or \fCxdg-open\fR).
