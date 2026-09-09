@@ -24,6 +24,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 use std::os::unix::fs::PermissionsExt;
 
+const APP_NAME: &'static str = "webdoc-pipe";
+const APP_VERSION: &'static str = "0.1.1";
+
 #[derive(Clone)]
 struct DocState {
     html: Arc<RwLock<Vec<u8>>>,
@@ -438,6 +441,8 @@ fn run_server() -> io::Result<()> {
 fn print_usage() {
     eprintln!(
         "Usage:
+
+    webdoc-pipe version       # Show Application Name and Version
     webdoc-pipe open          # Open in browser
     webdoc-pipe url           # Print URL
     webdoc-pipe stop          # Stop daemon
@@ -460,6 +465,10 @@ fn main() -> io::Result<()> {
     };
 
     match args.get(1).map(|s| s.as_str()) {
+        Some("version") => {
+            println!("{} {}",&APP_NAME, &APP_VERSION);
+            Ok(())
+          }
         Some("serve") => run_server(),
         Some("open") => {
             let m = ensure_server()?;
